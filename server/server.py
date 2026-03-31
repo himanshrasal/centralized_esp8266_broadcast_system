@@ -4,20 +4,67 @@ import sqlite3
 
 DB_NAME = "database.db"
 
+# =========================
+# INIT DB
+# =========================
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME, timeout=5)
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
     c.execute('''
-            CREATE TABLE IF NOT EXISTS sensor_data (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              name TEXT,
-              type TEXT,
-              isAnalog BOOL,
-              value REAL,
-              timestamp TEXT
-              )
-              ''')
+        CREATE TABLE IF NOT EXISTS sensor_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            type TEXT,
+            isAnalog BOOL,
+            value REAL,
+            timestamp TEXT
+        )
+    ''')
+
+    # 🔥 ADD isAlert
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS desired_states (
+            device TEXT,
+            output_id TEXT,
+            value INTEGER,
+            updated_at TEXT,
+            PRIMARY KEY (device, output_id)
+        )
+    ''')
+
+    # 🔥 ADD isAlert
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS actual_states (
+            device TEXT,
+            output_id TEXT,
+            value INTEGER,
+            isAlert INTEGER,   -- NEW
+            updated_at TEXT,
+            PRIMARY KEY (device, output_id)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS overrides (
+            device TEXT,
+            output_id TEXT,
+            enabled INTEGER,
+            PRIMARY KEY (device, output_id)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS outputs (
+            device TEXT,
+            output_id TEXT,
+            isAlert INTEGER,
+            last_seen TEXT,
+            PRIMARY KEY (device, output_id)
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -25,118 +72,396 @@ init_db()
 
 app = Flask(__name__)
 
+# =========================
+# HELPERS
+# =========================
+
+def set_desired_state(device, output_id, value):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    c.execute('''
+        INSERT INTO desired_states (device, output_id, value, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(device, output_id)
+        DO UPDATE SET value = excluded.value,
+                      updated_at = excluded.updated_at
+    ''', (device, output_id, value, datetime.now()))
+
+    conn.commit()
+    conn.close()
+
+def evaluate_rules(device, sensor_id, value):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    # example rules (hardcoded for now)
+    trigger = False
+
+    if sensor_id == "ldr":
+        trigger = (value > 30)
+
+    elif sensor_id == "gas":
+        trigger = (value > 400)
+
+    # apply to ALL alert outputs
+    c.execute('''
+        SELECT output_id FROM outputs
+        WHERE device = ? AND isAlert = 1
+    ''', (device,))
+
+    rows = c.fetchall()
+
+    for (output_id,) in rows:
+        set_desired_state(device, output_id, 1 if trigger else 0)
+
+    conn.close()
+
+
+# =========================
+# DATA ENDPOINT
+# =========================
+
 @app.route('/data', methods=['POST'])
 def receive_data():
     data = request.get_json()
-    
+
     if not data:
-        return jsonify({"status": "error", "message": "No JSON receieved"}), 400
+        return jsonify({"error": "no json"}), 400
 
-    name = data.get("name")
-    sensor_type = data.get("type")
-    value = data.get("value")
-    isAnalog = data.get("isAnalog")
-    time_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    dtype = data.get("type")
 
-    if name is None:
-        return jsonify({"status": "error", "message": "Missing name"}), 400
+    # SENSOR DATA
+    if dtype == "sensor":
+        device = data.get("device")
+        name = data.get("id")
+        sensor_type = data.get("sensorType")
+        value = float(data.get("value"))
+        isAnalog = data.get("isAnalog")
 
-    if sensor_type is None or value is None:
-        return jsonify({"status": "error", "message": "Missing Fields"}), 400
-    
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return jsonify({"status": "error", "message": "Invalid value"}), 400
-    
-    if isAnalog is None:
-        return jsonify({"status": "error", "message": "Missing isAnalog"}), 400
-
-    if not isinstance(isAnalog, bool):
-        return jsonify({"status": "error", "message": "isAnalog must be boolean"}), 400
-
-    try:
-        conn = sqlite3.connect(DB_NAME, timeout=5)
+        conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
 
         c.execute('''
             INSERT INTO sensor_data (name, type, isAnalog, value, timestamp)
             VALUES (?, ?, ?, ?, ?)
-        ''', (name, sensor_type, isAnalog, value, time_stamp))
+        ''', (name, sensor_type, isAnalog, value, datetime.now()))
 
         conn.commit()
         conn.close()
 
-        print(f"[{time_stamp}] {data}")
+        evaluate_rules(device, name, value)
 
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "ok"})
 
-    return jsonify({"status": "ok"})
+    # OUTPUT FEEDBACK
+    elif dtype == "output_state":
+        device = data.get("device")
+        outputs = data.get("outputs", [])
 
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
 
-@app.route('/')
-def root():
-    return render_template("dashboard.html")
+        for o in outputs:
+            c.execute('''
+                INSERT INTO actual_states (device, output_id, value, isAlert, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(device, output_id)
+                DO UPDATE SET value = excluded.value,
+                            isAlert = excluded.isAlert,
+                            updated_at = excluded.updated_at
+            ''', (device, o["id"], o["value"], int(o.get("isAlert", 0)), datetime.now()))
+            
+        conn.commit()
+        conn.close()
 
-@app.route('/latest', methods=['GET'])
-def latest_data():
-    limit = request.args.get('limit', default=10, type=int)
-
-    # enforce bounds
-    if limit < 1:
-        limit = 1
-    elif limit > 100:
-        limit = 100
+        return jsonify({"status": "ok"})
     
-    name = request.args.get('name')  # optional filter
+    return jsonify({"error": "invalid type"}), 400
 
-    conn = sqlite3.connect(DB_NAME, timeout=5)
+@app.route('/register_outputs', methods=['POST'])
+def register_outputs():
+    data = request.get_json()
+    device  = data.get("device")
+    outputs = data.get("outputs", [])
+
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
-    if name:
+    # Rebuild the outputs table so new/removed pins are reflected
+    c.execute('DELETE FROM outputs WHERE device = ?', (device,))
+
+    for o in outputs:
+        output_id = o["id"]
+        isAlert   = int(o.get("isAlert", 0))
+
         c.execute('''
-            SELECT name, type, isAnalog, value, timestamp
-            FROM sensor_data
-            WHERE name = ?
-            ORDER BY id DESC
-            LIMIT ?
-        ''', (name, limit))
-    else:
+            INSERT INTO outputs (device, output_id, isAlert, last_seen)
+            VALUES (?, ?, ?, ?)
+        ''', (device, output_id, isAlert, datetime.now()))
+
+        # INSERT OR IGNORE — keeps existing desired state, only adds if missing
         c.execute('''
-            SELECT name, type, isAnalog, value, timestamp
-            FROM sensor_data
-            ORDER BY id DESC
-            LIMIT ?
-        ''', (limit,))
+            INSERT OR IGNORE INTO desired_states (device, output_id, value, updated_at)
+            VALUES (?, ?, 0, ?)
+        ''', (device, output_id, datetime.now()))
+
+        # Same for overrides
+        c.execute('''
+            INSERT OR IGNORE INTO overrides (device, output_id, enabled)
+            VALUES (?, ?, 1)
+        ''', (device, output_id))
+
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "synced"})
+
+@app.route('/states')
+def get_states():
+    device = request.args.get("device")
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    c.execute('''
+        SELECT o.output_id, o.isAlert, d.value, ov.enabled
+        FROM outputs o
+        LEFT JOIN desired_states d
+            ON o.device = d.device AND o.output_id = d.output_id
+        LEFT JOIN overrides ov
+            ON o.device = ov.device AND o.output_id = ov.output_id
+        WHERE o.device = ?
+    ''', (device,))
 
     rows = c.fetchall()
     conn.close()
 
-    json = []
-    for r in rows:
-        json.append({
+    result = []
+
+    for output_id, isAlert, value, enabled in rows:
+        value = value if value is not None else 0
+        enabled = enabled if enabled is not None else 1
+
+        # block alerts if disabled
+        if isAlert == 1 and enabled == 0:
+            value = 0
+
+        result.append({
+            "id": output_id,
+            "value": value,
+            "enabled": enabled,
+            "isAlert": bool(isAlert)
+        })
+
+    return jsonify(result)
+
+@app.route('/set_output', methods=['POST'])
+def set_output():
+    data = request.get_json()
+    device    = data.get("device")
+    output_id = data.get("id")
+    value     = data.get("value")
+
+    # Don't allow the UI to override alert outputs — rules own them
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT isAlert FROM outputs WHERE device = ? AND output_id = ?', (device, output_id))
+    row = c.fetchone()
+    conn.close()
+
+    if row and row[0] == 1:
+        return jsonify({"status": "ignored", "reason": "alert output is rule-controlled"})
+
+    set_desired_state(device, output_id, value)
+    return jsonify({"status": "ok"})
+
+# =========================
+# DEVICE LIST
+# =========================
+
+@app.route('/devices')
+def devices():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    c.execute('SELECT DISTINCT device FROM outputs')
+    rows = c.fetchall()
+
+    conn.close()
+
+    return jsonify([r[0] for r in rows])
+
+
+# =========================
+# OVERRIDE CONTROL
+# =========================
+
+@app.route('/override', methods=['POST'])
+def override():
+    data = request.get_json()
+
+    device = data.get("device")
+    output_id = data.get("id")
+    enabled = data.get("enabled")
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    c.execute('''
+        INSERT INTO overrides (device, output_id, enabled)
+        VALUES (?, ?, ?)
+        ON CONFLICT(device, output_id)
+        DO UPDATE SET enabled = excluded.enabled
+    ''', (device, output_id, enabled))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({"status": "ok"})
+
+
+# =========================
+# DEBUG
+# =========================
+
+@app.route('/debug')
+def debug():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM desired_states")
+    desired = c.fetchall()
+
+    c.execute("SELECT * FROM actual_states")
+    actual = c.fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "desired": desired,
+        "actual": actual
+    })
+
+
+# =========================
+# UI ROUTES
+# =========================
+
+@app.route('/')
+def root():
+    return render_template("dashboard.html")  # unchanged
+
+
+@app.route('/control')
+def control():
+    return render_template("control.html")
+
+
+# =========================
+# OLD ROUTES (UNCHANGED)
+# =========================
+
+@app.route('/latest')
+def latest_data():
+    name = request.args.get("name")
+    limit = request.args.get("limit", 10)
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    query = '''
+        SELECT name, type, isAnalog, value, timestamp
+        FROM sensor_data
+    '''
+
+    params = []
+
+    if name:
+        query += " WHERE name = ?"
+        params.append(name)
+
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+
+    c.execute(query, params)
+    rows = c.fetchall()
+
+    conn.close()
+
+    return jsonify([
+        {
             "name": r[0],
             "type": r[1],
             "isAnalog": bool(r[2]),
             "value": r[3],
             "timestamp": r[4]
-        })
+        }
+        for r in rows
+    ])
+    
+@app.route('/set_output_batch', methods=['POST'])
+def set_output_batch():
+    """Handle multiple output changes at once"""
+    data = request.get_json()
+    
+    device = data.get("device")
+    outputs = data.get("outputs", [])
+    
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    for output in outputs:
+        output_id = output.get("id")
+        value = output.get("value")
+        
+        c.execute('''
+            INSERT INTO desired_states (device, output_id, value, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(device, output_id)
+            DO UPDATE SET value = excluded.value,
+                          updated_at = excluded.updated_at
+        ''', (device, output_id, value, datetime.now()))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "ok"})
 
-    return jsonify(json)
+@app.route('/clear_override', methods=['POST'])
+def clear_override():
+    """Clear manual override for an output"""
+    data = request.get_json()
+    device = data.get("device")
+    output_id = data.get("id")
+    
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    # Clear override in database
+    c.execute('DELETE FROM overrides WHERE device = ? AND output_id = ?', 
+              (device, output_id))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "ok"})
 
-@app.route('/names', methods=['GET'])
-def get_names():
-    conn = sqlite3.connect(DB_NAME, timeout=5)
+@app.route('/names')
+def names():
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
     c.execute('SELECT DISTINCT name FROM sensor_data')
     rows = c.fetchall()
+
     conn.close()
 
-    names = [r[0] for r in rows]
+    return jsonify([r[0] for r in rows])
 
-    return jsonify(names)
+
+# =========================
+# RUN
+# =========================
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host="0.0.0.0", port=5000)
