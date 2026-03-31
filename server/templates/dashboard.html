@@ -1,0 +1,138 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Sensor Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+
+  <body class="bg-gray-900 text-white p-6">
+    <h1 class="text-3xl font-bold mb-6">Sensor Dashboard</h1>
+
+    <!-- Controls -->
+    <div class="mb-4 flex gap-4 items-center">
+      <!-- Dropdown -->
+      <select id="nameSelect" class="text-black p-2 rounded">
+        <option value="">All</option>
+      </select>
+
+      <!-- Search -->
+      <input
+        id="nameInput"
+        type="text"
+        placeholder="Search name"
+        class="text-black p-2 rounded"
+      />
+
+      <!-- Limit -->
+      <input
+        id="limitInput"
+        type="number"
+        value="10"
+        min="1"
+        max="100"
+        class="text-black p-2 rounded w-20"
+      />
+    </div>
+
+    <!-- Table -->
+    <div class="overflow-x-auto">
+      <table class="w-full border border-gray-700 text-sm">
+        <thead class="bg-gray-800">
+          <tr>
+            <th class="p-2 text-left">Name</th>
+            <th class="p-2 text-left">Type</th>
+            <th class="p-2 text-left">Analog</th>
+            <th class="p-2 text-left">Value</th>
+            <th class="p-2 text-left">Timestamp</th>
+          </tr>
+        </thead>
+
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+
+    <script>
+      // load dropdown names
+      async function loadNames() {
+        const res = await fetch("/names");
+        const names = await res.json();
+
+        const select = document.getElementById("nameSelect");
+
+        names.sort();
+
+        names.forEach((name) => {
+          const option = document.createElement("option");
+          option.value = name;
+          option.textContent = name;
+          select.appendChild(option);
+        });
+      }
+
+      // fetch data
+      async function fetchData() {
+        const dropdownName = document.getElementById("nameSelect").value;
+        const inputName = document.getElementById("nameInput").value.trim();
+        const limit = document.getElementById("limitInput").value;
+
+        let finalName = inputName || dropdownName;
+
+        let url = `/latest?limit=${limit}`;
+
+        if (finalName) {
+          url += `&name=${encodeURIComponent(finalName)}`;
+        }
+
+        const res = await fetch(url);
+        const data = await res.json();
+
+        renderTable(data);
+      }
+
+      // render table
+      function renderTable(data) {
+        const tbody = document.getElementById("tableBody");
+        tbody.innerHTML = "";
+
+        data.forEach((sensor) => {
+          let color = "text-green-400";
+          if (sensor.value > 500) color = "text-red-400";
+
+          const row = `
+            <tr class="border-t border-gray-700 hover:bg-gray-800">
+                <td class="p-2">${sensor.name}</td>
+                <td class="p-2">${sensor.type}</td>
+                <td class="p-2">${sensor.isAnalog}</td>
+                <td class="p-2 font-bold ${color}">${sensor.value}</td>
+                <td class="p-2 text-gray-400">${sensor.timestamp}</td>
+            </tr>
+        `;
+
+          tbody.innerHTML += row;
+        });
+      }
+
+      // dropdown → clears search
+      document.getElementById("nameSelect").addEventListener("change", () => {
+        document.getElementById("nameInput").value = "";
+        fetchData();
+      });
+
+      // search → sets dropdown to "All"
+      document.getElementById("nameInput").addEventListener("input", () => {
+        document.getElementById("nameSelect").value = "";
+        fetchData();
+      });
+
+      // limit change
+      document
+        .getElementById("limitInput")
+        .addEventListener("input", fetchData);
+
+      // init
+      loadNames();
+      fetchData();
+      setInterval(fetchData, 1000);
+    </script>
+  </body>
+</html>

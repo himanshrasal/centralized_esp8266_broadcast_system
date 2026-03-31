@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from datetime import datetime
 import sqlite3
 
@@ -74,9 +74,69 @@ def receive_data():
 
     return jsonify({"status": "ok"})
 
+
 @app.route('/')
 def root():
-    return "hello there my nigga"
+    return render_template("dashboard.html")
+
+@app.route('/latest', methods=['GET'])
+def latest_data():
+    limit = request.args.get('limit', default=10, type=int)
+
+    # enforce bounds
+    if limit < 1:
+        limit = 1
+    elif limit > 100:
+        limit = 100
+    
+    name = request.args.get('name')  # optional filter
+
+    conn = sqlite3.connect(DB_NAME, timeout=5)
+    c = conn.cursor()
+
+    if name:
+        c.execute('''
+            SELECT name, type, isAnalog, value, timestamp
+            FROM sensor_data
+            WHERE name = ?
+            ORDER BY id DESC
+            LIMIT ?
+        ''', (name, limit))
+    else:
+        c.execute('''
+            SELECT name, type, isAnalog, value, timestamp
+            FROM sensor_data
+            ORDER BY id DESC
+            LIMIT ?
+        ''', (limit,))
+
+    rows = c.fetchall()
+    conn.close()
+
+    json = []
+    for r in rows:
+        json.append({
+            "name": r[0],
+            "type": r[1],
+            "isAnalog": bool(r[2]),
+            "value": r[3],
+            "timestamp": r[4]
+        })
+
+    return jsonify(json)
+
+@app.route('/names', methods=['GET'])
+def get_names():
+    conn = sqlite3.connect(DB_NAME, timeout=5)
+    c = conn.cursor()
+
+    c.execute('SELECT DISTINCT name FROM sensor_data')
+    rows = c.fetchall()
+    conn.close()
+
+    names = [r[0] for r in rows]
+
+    return jsonify(names)
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
