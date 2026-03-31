@@ -1,433 +1,411 @@
-#include <ArduinoJson.h>
-#include <ESP8266HTTPClient.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
 #include <cstring>
+#include <ArduinoJson.h>
 
-const char *ssid = "himanshrasal";
-const char *passwd = "mangakeyou";
+const char* ssid       = "himanshrasal";
+const char* passwd     = "mangakeyou";
+const char* deviceName = "esp2";
 
-const char *deviceName = "esp1";
+const char* serverUrl   = "http://192.168.0.103:5000/data";
+const char* stateUrl    = "http://192.168.0.103:5000/states";
+const char* registerUrl = "http://192.168.0.103:5000/register_outputs";
 
-const char *serverUrl = "http://192.168.0.103:5000/data";
-const char *stateUrl = "http://192.168.0.103:5000/states";
-
-// Timing variables
-unsigned long lastStateFetch = 0;
-unsigned long stateInterval = 2000; // 2 seconds
-unsigned long lastFeedback = 0;
-unsigned long feedbackInterval = 3000; // 3 seconds
+unsigned long lastStateFetch      = 0;
+const unsigned long stateInterval = 2000;
+unsigned long lastFeedback        = 0;
+const unsigned long feedbackInterval = 3000;
 unsigned long lastRegisterAttempt = 0;
 bool registered = false;
 
-// ================= SENSOR =================
+// =================================================================
+// SENSOR CONFIG
+// Add/remove sensors here. One entry = one sensor.
+// Fields: { id, sensorType, isAnalog, pin, intervalMs, usePullUp, invertDigital }
+// =================================================================
+
+struct SensorConfig {
+    const char* id;
+    const char* sensorType;
+    bool        isAnalog;
+    uint8_t     pin;
+    unsigned long intervalMs;
+    bool        usePullUp;
+    bool        invertDigital;
+};
+
+static const SensorConfig SENSOR_CONFIGS[] = {
+    // id          type      analog  pin  interval  pullup  invert
+    { "ldr",  "light",  true,   A0,  2000,     false,  false },
+    // { "pir1",  "motion", false,  D6,  500,       false,  false },
+};
+
+static const int SENSOR_COUNT = sizeof(SENSOR_CONFIGS) / sizeof(SENSOR_CONFIGS[0]);
+
+// =================================================================
+// OUTPUT CONFIG
+// Add/remove outputs here. One entry = one output.
+//
+// isAlert = true  -> driven by LOCAL RULES only (web UI cannot override)
+// isAlert = false -> driven by WEB UI only (rules cannot override)
+//
+// Fields: { id, pin, isAlert, invertPin }
+// =================================================================
+
+struct OutputConfig {
+    const char* id;
+    uint8_t     pin;
+    bool        isAlert;
+    bool        invertPin;
+};
+
+static const OutputConfig OUTPUT_CONFIGS[] = {
+    // id          pin  alert  invert
+    { "buzzer",  D3,  true,  false  },   // alert  - rule-driven, active-LOW
+    { "led1",      D2,  false, true  },   // normal - web-driven,  active-LOW
+    // { "alarm2",D8,  true,  false },
+};
+
+static const int OUTPUT_COUNT = sizeof(OUTPUT_CONFIGS) / sizeof(OUTPUT_CONFIGS[0]);
+
+// =================================================================
+// RULES TABLE
+// Maps sensor readings to output states automatically.
+// Only alert outputs should appear here (normal outputs are web-only).
+//
+// Fields: { sensorId, outputId, triggerValue, outputValue }
+// =================================================================
+
+struct Rule {
+    const char* sensorId;
+    const char* outputId;
+    float       triggerValue;
+    int         outputValue;
+};
+
+static const Rule RULES[] = {
+    // sensorId    outputId   trigger  output
+    { "button1",  "buzzer1",  1.0f,   1 },
+    { "button1",  "buzzer1",  0.0f,   0 },
+    // { "pir1",  "alarm2",   1.0f,   1 },
+    // { "pir1",  "alarm2",   0.0f,   0 },
+};
+
+static const int RULE_COUNT = sizeof(RULES) / sizeof(RULES[0]);
+
+// =================================================================
+// SENSOR CLASS
+// =================================================================
 
 struct Sensor {
-  char id[20];
-  char type[10];
-  bool isAnalog;
-  uint8_t pin;
-  float value;
-  bool digitalInvert = false;
+    char          id[20];
+    char          type[16];
+    bool          isAnalog;
+    uint8_t       pin;
+    unsigned long interval;
+    bool          usePullUp;
+    bool          digitalInvert;
+    float         value;
+    unsigned long lastSent;
 
-  unsigned long interval = 3000;
-  unsigned long lastSent = 0;
+    void init(const SensorConfig& cfg) {
+        strncpy(id,   cfg.id,         sizeof(id)   - 1); id[sizeof(id)-1]     = '\0';
+        strncpy(type, cfg.sensorType, sizeof(type) - 1); type[sizeof(type)-1] = '\0';
+        isAnalog      = cfg.isAnalog;
+        pin           = cfg.pin;
+        interval      = cfg.intervalMs;
+        usePullUp     = cfg.usePullUp;
+        digitalInvert = cfg.invertDigital;
+        value         = 0;
+        lastSent      = 0;
 
-  Sensor(const char *id, const char *type, bool isAnalog, uint8_t pin,
-         unsigned long interval) {
-    strncpy(this->id, id, sizeof(this->id) - 1);
-    this->id[sizeof(this->id) - 1] = '\0';
-
-    strncpy(this->type, type, sizeof(this->type) - 1);
-    this->type[sizeof(this->type) - 1] = '\0';
-
-    this->isAnalog = isAnalog;
-    this->pin = pin;
-    this->interval = interval;
-
-    value = 0;
-    lastSent = 0;
-  }
-
-  void init() {
-    if (isAnalog)
-      return;
-    pinMode(pin, INPUT);
-  }
-
-  void setPullUp() {
-    if (isAnalog)
-      return;
-    pinMode(pin, INPUT_PULLUP);
-  }
-
-  void setDigitalInversion(bool inversion) { digitalInvert = inversion; }
-
-  void readData() {
-    if (isAnalog) {
-      if (pin != A0) {
-        value = 0;
-        Serial.println("Wrong analog pin.");
-        return;
-      }
-      value = analogRead(pin);
-    } else {
-      bool raw = digitalRead(pin);
-      value = digitalInvert ? !raw : raw;
+        if (!isAnalog) {
+            if (usePullUp) pinMode(pin, INPUT_PULLUP);
+            else           pinMode(pin, INPUT);
+        }
     }
-  }
 
-  bool ready() { return millis() - lastSent >= interval; }
+    void readData() {
+        if (isAnalog) {
+            value = (pin == A0) ? analogRead(pin) : 0;
+        } else {
+            bool raw = digitalRead(pin);
+            value = digitalInvert ? !raw : raw;
+        }
+    }
 
-  void sendData() {
+    bool ready() { return millis() - lastSent >= interval; }
+
+    void sendData() {
+        WiFiClient client;
+        HTTPClient http;
+        http.begin(client, serverUrl);
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(1500);
+
+        char json[256];
+        snprintf(json, sizeof(json),
+            "{\"device\":\"%s\",\"id\":\"%s\",\"type\":\"sensor\","
+            "\"sensorType\":\"%s\",\"isAnalog\":%s,\"value\":%.2f}",
+            deviceName, id, type,
+            isAnalog ? "true" : "false",
+            value);
+
+        int code = http.POST(json);
+        http.end();
+        if (code == 200) Serial.printf("Sensor [%s] sent: %.2f\n", id, value);
+        else if (code > 0) Serial.printf("Sensor [%s] HTTP: %d\n", id, code);
+    }
+
+    void activate() {
+        if (!ready()) return;
+        readData();
+        if (WiFi.status() == WL_CONNECTED) sendData();
+        lastSent = millis();
+    }
+};
+
+// =================================================================
+// OUTPUT CLASS
+// =================================================================
+
+struct Output {
+    char          outputId[20];
+    uint8_t       pin;
+    bool          isAlert;
+    bool          invert;
+    bool          state;
+    unsigned long lastChange;
+
+    void init(const OutputConfig& cfg) {
+        strncpy(outputId, cfg.id, sizeof(outputId) - 1); outputId[sizeof(outputId)-1] = '\0';
+        pin         = cfg.pin;
+        isAlert     = cfg.isAlert;
+        invert      = cfg.invertPin;
+        state       = false;
+        lastChange  = 0;
+        pinMode(pin, OUTPUT);
+        applyPin(false);
+    }
+
+    void applyPin(bool newState) {
+        digitalWrite(pin, (newState ^ invert) ? HIGH : LOW);
+    }
+
+    void handleCommand(const char* incomingId, int value, bool fromWeb) {
+        if (strcmp(incomingId, outputId) != 0) return;
+        if (millis() - lastChange < 100) return;
+
+        if (isAlert  &&  fromWeb) return;
+        if (!isAlert && !fromWeb) return;
+
+        bool newState = (value != 0);
+        if (state == newState) return;
+
+        state = newState;
+        applyPin(state);
+        lastChange = millis();
+        Serial.printf("Output [%s]: %s\n", outputId, state ? "ON" : "OFF");
+    }
+};
+
+// =================================================================
+// RUNTIME INSTANCES
+// =================================================================
+
+static Sensor sensors[SENSOR_COUNT];
+static Output outputs[OUTPUT_COUNT];
+
+// =================================================================
+// RULE ENGINE
+// =================================================================
+
+void evaluateRules() {
+    for (int r = 0; r < RULE_COUNT; r++) {
+        const Rule& rule = RULES[r];
+        for (int s = 0; s < SENSOR_COUNT; s++) {
+            if (strcmp(sensors[s].id, rule.sensorId) != 0) continue;
+            if (sensors[s].value == rule.triggerValue) {
+                for (int o = 0; o < OUTPUT_COUNT; o++) {
+                    outputs[o].handleCommand(rule.outputId, rule.outputValue, false);
+                }
+            }
+        }
+    }
+}
+
+// =================================================================
+// OUTPUT POLLING  (web -> ESP)
+// =================================================================
+
+void checkOutputs() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
     WiFiClient client;
     HTTPClient http;
 
+    char url[80];
+    snprintf(url, sizeof(url), "%s?device=%s", stateUrl, deviceName);
+    http.begin(client, url);
+    http.setTimeout(1500);
+    int code = http.GET();
+
+    if (code == 200) {
+        String payload = http.getString();
+
+        StaticJsonDocument<1024> doc;
+        DeserializationError err = deserializeJson(doc, payload);
+
+        if (!err) {
+            JsonArray arr = doc.as<JsonArray>();
+            for (JsonObject o : arr) {
+                const char* id = o["id"].as<const char*>();
+                int         val = o["value"].as<int>();
+                for (int i = 0; i < OUTPUT_COUNT; i++) {
+                    outputs[i].handleCommand(id, val, true);
+                }
+            }
+        } else {
+            Serial.print("JSON err: "); Serial.println(err.c_str());
+        }
+    }
+    http.end();
+}
+
+// =================================================================
+// FEEDBACK  (ESP -> server)
+// =================================================================
+
+void sendOutputStates() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClient client;
+    HTTPClient http;
     http.begin(client, serverUrl);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(1000);
+    http.setTimeout(1500);
 
-    String json = "{";
-    json += "\"device\":\"" + String(deviceName) + "\",";
-    json += "\"id\":\"" + String(this->id) + "\",";
-    json += "\"type\":\"sensor\",";
-    json += "\"sensorType\":\"" + String(this->type) + "\",";
-    json += "\"isAnalog\":" + String(this->isAnalog ? "true" : "false") + ",";
-    json += "\"value\":" + String(this->value);
-    json += "}";
+    char json[512];
+    int pos = snprintf(json, sizeof(json),
+        "{\"device\":\"%s\",\"type\":\"output_state\",\"outputs\":[", deviceName);
+
+    for (int i = 0; i < OUTPUT_COUNT; i++) {
+        pos += snprintf(json + pos, sizeof(json) - pos,
+            "{\"id\":\"%s\",\"value\":%d,\"isAlert\":%s}%s",
+            outputs[i].outputId,
+            outputs[i].state ? 1 : 0,
+            outputs[i].isAlert ? "true" : "false",
+            i < OUTPUT_COUNT - 1 ? "," : "");
+    }
+    snprintf(json + pos, sizeof(json) - pos, "]}");
+
+    int code = http.POST(json);
+    http.end();
+    if (code != 200 && code > 0) Serial.printf("Feedback HTTP: %d\n", code);
+}
+
+// =================================================================
+// REGISTER OUTPUTS
+// =================================================================
+
+void registerOutputs() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, registerUrl);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(2000);
+
+    char json[256];
+    int pos = snprintf(json, sizeof(json),
+        "{\"device\":\"%s\",\"outputs\":[", deviceName);
+
+    for (int i = 0; i < OUTPUT_COUNT; i++) {
+        pos += snprintf(json + pos, sizeof(json) - pos,
+            "{\"id\":\"%s\",\"isAlert\":%s}%s",
+            outputs[i].outputId,
+            outputs[i].isAlert ? "true" : "false",
+            i < OUTPUT_COUNT - 1 ? "," : "");
+    }
+    snprintf(json + pos, sizeof(json) - pos, "]}");
 
     int code = http.POST(json);
     http.end();
 
-    if (code == 200) {
-      Serial.println("Sensor sent");
-    } else if (code > 0) {
-      Serial.printf("Sensor HTTP: %d\n", code);
-    }
-  }
-
-  void activate() {
-    if (!ready())
-      return;
-
-    readData();
-
-    if (WiFi.status() == WL_CONNECTED) {
-      sendData();
-    }
-
-    lastSent = millis();
-  }
-};
-
-// ================= OUTPUT =================
-struct Output {
-  char outputId[20];
-  uint8_t pin;
-  bool state;
-  bool invert = false;
-  bool isAlert = false;
-  bool manualOverride = false; // NEW: Track if manually controlled
-  unsigned long lastChange = 0;
-
-  Output(const char *id, uint8_t pin, bool isAlert = false) {
-    strncpy(this->outputId, id, sizeof(this->outputId) - 1);
-    this->outputId[sizeof(this->outputId) - 1] = '\0';
-
-    this->pin = pin;
-    this->state = false;
-    this->isAlert = isAlert;
-    this->manualOverride = false;
-    this->lastChange = 0;
-  }
-
-  void init() {
-    pinMode(pin, OUTPUT);
-    setState(false);
-  }
-
-  void setInversion(bool inv) { invert = inv; }
-
-  void setState(bool newState, bool fromManual = false) {
-    if (state == newState)
-      return;
-
-    state = newState;
-    manualOverride = fromManual;
-
-    bool outputLevel;
-    if (invert) {
-      outputLevel = !state;
-    } else {
-      outputLevel = state;
-    }
-
-    digitalWrite(pin, outputLevel ? HIGH : LOW);
-    lastChange = millis();
-
-    Serial.printf("%s: %s (manual=%d)\n", outputId, state ? "ON" : "OFF",
-                  manualOverride);
-  }
-
-  void handleCommand(const String &incomingId, int value, bool fromWeb = true) {
-    if (incomingId != String(this->outputId))
-      return;
-
-    // Don't allow rapid toggling
-    if (millis() - lastChange < 100)
-      return;
-
-    // If this is from web and output is alert type, track manual override
-    if (fromWeb && isAlert) {
-      setState(value, true);
-    }
-    // If this is from rules (button) and no manual override, apply
-    else if (!fromWeb && !manualOverride) {
-      setState(value, false);
-    }
-    // If from rules but has manual override, ignore
-    else if (!fromWeb && manualOverride) {
-      Serial.printf("Ignoring rule for %s due to manual override\n", outputId);
-    }
-    // If from web and not alert type
-    else if (fromWeb && !isAlert) {
-      setState(value, true);
-    }
-  }
-
-  void clearManualOverride() {
-    manualOverride = false;
-    Serial.printf("Cleared manual override for %s\n", outputId);
-  }
-};
-
-// ================= OBJECTS =================
-
-Sensor btn("button1", "button", false, D5, 1000);
-
-Output outputs[] = {
-    Output("buzzer1", D3, true), // Alert type
-    Output("led", D4, false)     // Normal type
-};
-
-const int OUTPUT_COUNT = sizeof(outputs) / sizeof(outputs[0]);
-
-// ================= RULE EVALUATION =================
-void evaluateRules() {
-  // Check button state and control buzzer
-  if (btn.value == 1) {
-    // Button pressed - trigger buzzer if no manual override
-    outputs[0].handleCommand("buzzer1", 1, false); // from rule
-  } else {
-    // Button released - turn off buzzer if no manual override
-    outputs[0].handleCommand("buzzer1", 0, false); // from rule
-  }
+    if (code == 200) { registered = true; Serial.println("Registered outputs OK"); }
+    else              { Serial.printf("Register failed: %d\n", code); }
 }
 
-// ================= OUTPUT POLLING =================
-
-void checkOutputs() {
-  if (WiFi.status() != WL_CONNECTED)
-    return;
-
-  WiFiClient client;
-  HTTPClient http;
-
-  String url = String(stateUrl) + "?device=" + deviceName;
-
-  http.begin(client, url);
-  http.setTimeout(1000);
-  int code = http.GET();
-
-  if (code == 200) {
-    String payload = http.getString();
-
-    // Use small buffer to save memory
-    DynamicJsonDocument doc(1024);
-    DeserializationError err = deserializeJson(doc, payload);
-
-    if (!err) {
-      JsonArray arr = doc.as<JsonArray>();
-
-      for (JsonObject o : arr) {
-        String id = o["id"];
-        int value = o["value"];
-
-        for (int i = 0; i < OUTPUT_COUNT; i++) {
-          outputs[i].handleCommand(id, value, true); // from web
-        }
-      }
-    } else {
-      Serial.print("JSON error: ");
-      Serial.println(err.c_str());
-    }
-  }
-
-  http.end();
-}
-
-// ================= FEEDBACK =================
-
-void sendOutputStates() {
-  if (WiFi.status() != WL_CONNECTED)
-    return;
-
-  WiFiClient client;
-  HTTPClient http;
-
-  http.begin(client, serverUrl);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(1000);
-
-  // Use smaller JSON
-  String json = "{";
-  json += "\"device\":\"" + String(deviceName) + "\",";
-  json += "\"type\":\"output_state\",";
-  json += "\"outputs\":[";
-
-  for (int i = 0; i < OUTPUT_COUNT; i++) {
-    json += "{";
-    json += "\"id\":\"" + String(outputs[i].outputId) + "\",";
-    json += "\"value\":" + String(outputs[i].state) + ",";
-    json += "\"isAlert\":" + String(outputs[i].isAlert ? "true" : "false");
-    json += "}";
-
-    if (i != OUTPUT_COUNT - 1)
-      json += ",";
-  }
-
-  json += "]}";
-
-  int code = http.POST(json);
-  http.end();
-
-  if (code == 200) {
-    // Success, no debug
-  }
-}
-
-void registerOutputs() {
-  if (WiFi.status() != WL_CONNECTED)
-    return;
-
-  WiFiClient client;
-  HTTPClient http;
-
-  http.begin(client, "http://192.168.0.103:5000/register_outputs");
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(1000);
-
-  String json = "{";
-  json += "\"device\":\"" + String(deviceName) + "\",";
-  json += "\"outputs\":[";
-
-  for (int i = 0; i < OUTPUT_COUNT; i++) {
-    json += "{";
-    json += "\"id\":\"" + String(outputs[i].outputId) + "\",";
-    json += "\"isAlert\":" + String(outputs[i].isAlert ? "true" : "false");
-    json += "}";
-
-    if (i != OUTPUT_COUNT - 1)
-      json += ",";
-  }
-
-  json += "]}";
-
-  int code = http.POST(json);
-  http.end();
-
-  if (code == 200) {
-    registered = true;
-    Serial.println("Registered outputs successfully");
-  } else {
-    Serial.printf("Register failed: %d\n", code);
-  }
-}
-
-// ================= SETUP =================
+// =================================================================
+// SETUP
+// =================================================================
 
 void setup() {
-  Serial.begin(115200);
-  delay(10);
+    Serial.begin(115200);
+    delay(10);
+    Serial.println("\nESP Starting...");
 
-  Serial.println("\n\nESP Starting...");
+    for (int i = 0; i < SENSOR_COUNT; i++) sensors[i].init(SENSOR_CONFIGS[i]);
+    for (int i = 0; i < OUTPUT_COUNT; i++) outputs[i].init(OUTPUT_CONFIGS[i]);
 
-  // Setup WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, passwd);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, passwd);
 
-  Serial.print("Connecting to WiFi");
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
+    Serial.print("Connecting");
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+        delay(500); Serial.print("."); attempts++;
+    }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi OK! IP: " + WiFi.localIP().toString());
+        delay(500);
+        registerOutputs();
+    } else {
+        Serial.println("\nWiFi failed!");
+    }
 
-    delay(1000); // Wait for network stability
-    registerOutputs();
-  } else {
-    Serial.println("\nWiFi connection failed!");
-  }
-
-  // Initialize sensors
-  btn.init();
-  btn.setPullUp();
-  btn.setDigitalInversion(true);
-
-  // Initialize outputs
-  for (int i = 0; i < OUTPUT_COUNT; i++) {
-    outputs[i].init();
-  }
-
-  outputs[0].setInversion(true); // buzzer (active LOW)
-  outputs[1].setInversion(true); // led (active LOW)
-
-  Serial.println("Setup complete!");
+    Serial.printf("Loaded %d sensor(s), %d output(s), %d rule(s)\n",
+                  SENSOR_COUNT, OUTPUT_COUNT, RULE_COUNT);
+    Serial.println("Setup done!");
 }
 
-// ================= LOOP =================
+// =================================================================
+// LOOP
+// =================================================================
 
 void loop() {
-  // Handle WiFi connection
-  if (WiFi.status() != WL_CONNECTED) {
-    static unsigned long lastReconnect = 0;
-    if (millis() - lastReconnect > 10000) { // Try reconnect every 10 sec
-      Serial.println("WiFi lost, reconnecting...");
-      WiFi.begin(ssid, passwd);
-      lastReconnect = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+        static unsigned long lastRecon = 0;
+        if (millis() - lastRecon > 10000) {
+            Serial.println("Reconnecting WiFi...");
+            WiFi.begin(ssid, passwd);
+            lastRecon = millis();
+        }
+        delay(100);
+        return;
     }
-    delay(100);
-    return;
-  }
 
-  // Register if not registered yet
-  if (!registered && millis() - lastRegisterAttempt > 10000) {
-    registerOutputs();
-    lastRegisterAttempt = millis();
-  }
+    if (!registered && millis() - lastRegisterAttempt > 10000) {
+        registerOutputs();
+        lastRegisterAttempt = millis();
+    }
 
-  // Read button and evaluate rules
-  btn.activate();
-  evaluateRules(); // This will trigger buzzer based on button
+    for (int i = 0; i < SENSOR_COUNT; i++) sensors[i].activate();
 
-  // Poll for web commands
-  if (millis() - lastStateFetch > stateInterval) {
-    checkOutputs();
-    lastStateFetch = millis();
-  }
+    evaluateRules();
 
-  // Send feedback to server
-  if (millis() - lastFeedback > feedbackInterval) {
-    sendOutputStates();
-    lastFeedback = millis();
-  }
+    if (millis() - lastStateFetch > stateInterval) {
+        checkOutputs();
+        lastStateFetch = millis();
+    }
 
-  // Small delay to prevent watchdog
-  delay(10);
+    if (millis() - lastFeedback > feedbackInterval) {
+        sendOutputStates();
+        lastFeedback = millis();
+    }
+
+    delay(10);
 }
