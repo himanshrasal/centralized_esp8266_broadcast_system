@@ -91,18 +91,29 @@ def set_desired_state(device, output_id, value):
     conn.commit()
     conn.close()
 
-def evaluate_rules(device, sensor_id, value):
+def evaluate_rules(device, sensor_type, value, isAnalog):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
     # example rules (hardcoded for now)
     trigger = False
 
-    if sensor_id == "ldr":
-        trigger = (value > 30)
+    if isAnalog:
+        if sensor_type == "light":
+            trigger = (value > 30)
 
-    elif sensor_id == "gas":
-        trigger = (value > 400)
+        elif sensor_type == "gas":
+            trigger = (value > 400)
+            
+    else:
+        if sensor_type == "light":
+            trigger = value>0
+
+        elif sensor_type == "gas":
+            trigger = value>0
+            
+        elif sensor_type == "motion":
+            trigger = value>0
 
     # apply to ALL alert outputs
     c.execute('''
@@ -150,7 +161,7 @@ def receive_data():
         conn.commit()
         conn.close()
 
-        evaluate_rules(device, name, value)
+        evaluate_rules(device, sensor_type, value, isAnalog)
 
         return jsonify({"status": "ok"})
 

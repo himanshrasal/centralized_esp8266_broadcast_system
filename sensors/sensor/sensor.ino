@@ -6,7 +6,7 @@
 
 const char* ssid       = "himanshrasal";
 const char* passwd     = "mangakeyou";
-const char* deviceName = "esp2";
+const char* deviceName = "esp_motion";
 
 const char* serverUrl   = "http://192.168.0.103:5000/data";
 const char* stateUrl    = "http://192.168.0.103:5000/states";
@@ -37,8 +37,8 @@ struct SensorConfig {
 
 static const SensorConfig SENSOR_CONFIGS[] = {
     // id          type      analog  pin  interval  pullup  invert
-    { "ldr",  "light",  true,   A0,  2000,     false,  false },
-    // { "pir1",  "motion", false,  D6,  500,       false,  false },
+    // { "motion",  "light",  true,   D8,  2000,     false,  false },
+    { "pir",  "motion", false,  D8,  1000,       false,  false },
 };
 
 static const int SENSOR_COUNT = sizeof(SENSOR_CONFIGS) / sizeof(SENSOR_CONFIGS[0]);
@@ -62,8 +62,8 @@ struct OutputConfig {
 
 static const OutputConfig OUTPUT_CONFIGS[] = {
     // id          pin  alert  invert
-    { "buzzer",  D3,  true,  false  },   // alert  - rule-driven, active-LOW
-    { "led1",      D2,  false, true  },   // normal - web-driven,  active-LOW
+    { "buzzer",  D5,  true,  false  },   // alert  - rule-driven, active-LOW
+    // { "led1",      D2,  false, true  },   // normal - web-driven,  active-LOW
     // { "alarm2",D8,  true,  false },
 };
 
@@ -86,10 +86,8 @@ struct Rule {
 
 static const Rule RULES[] = {
     // sensorId    outputId   trigger  output
-    { "button1",  "buzzer1",  1.0f,   1 },
-    { "button1",  "buzzer1",  0.0f,   0 },
-    // { "pir1",  "alarm2",   1.0f,   1 },
-    // { "pir1",  "alarm2",   0.0f,   0 },
+    { "pir",  "buzzer",   1.0f,   1 },
+    { "pir",  "buzzer",   0.0f,   0 },
 };
 
 static const int RULE_COUNT = sizeof(RULES) / sizeof(RULES[0]);
